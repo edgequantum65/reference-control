@@ -2,6 +2,8 @@ import functools
 import json
 import math
 import os
+import random
+import re
 import sys
 import tempfile
 import unittest
@@ -9,6 +11,8 @@ from unittest import mock
 
 import example_peaks
 from example_peaks import FLAT, NOISE, TWO_PEAKS, build, count_peaks, count_peaks_broken
+from fractions import Fraction
+
 from reference_control import Instrument, NotCalibrated
 
 
@@ -26,6 +30,48 @@ def peaks_via_module(signal):
 
 def scaled_sum(xs, k):
     return k * sum(xs)
+
+
+def uses_threshold(x):
+    return x * example_peaks.THRESHOLD
+
+
+def reads_module_twice(x):  # reads example_peaks.FLAT itself, and example_peaks.THRESHOLD through a helper
+    return example_peaks.FLAT[0] + uses_threshold(x)
+
+
+class Detector:
+    T = 1.0
+
+    def __init__(self, t):
+        self.t = t
+
+    def count(self, xs):
+        return sum(1 for x in xs if x > self.t)
+
+
+DETECTOR = Detector(1.0)
+
+
+def count_with_detector(xs):
+    return DETECTOR.count(xs) + 0 * DETECTOR.T
+
+
+class scaled:  # a class-based decorator
+    def __init__(self, func, k=1.0):
+        functools.update_wrapper(self, func)
+        self.k = k
+
+    def __call__(self, x):
+        return self.k * self.__wrapped__(x)
+
+
+CACHE = {}
+
+
+def cached_double(x):
+    CACHE[x] = 2 * x
+    return CACHE[x]
 
 
 class ReferenceControlTests(unittest.TestCase):
@@ -215,6 +261,90 @@ class ReferenceControlTests(unittest.TestCase):
         self.assertEqual(len(inst.checks[1].inputs), 200)
         self.assertEqual(inst.measure([5.0]), 1)
 
+    # --- found in review: what the fingerprint must follow, and what must not cause a refusal
+
+    def test_module_attribute_read_by_a_helper(self):
+        inst = Instrument("module twice", reads_module_twice).reference("one", 1.0, 1.0).blank("zero", 0.0)
+        self.assertTrue(inst.calibrate().passed)
+        with mock.patch.object(example_peaks, "THRESHOLD", 100.0):
+            with self.assertRaises(NotCalibrated):
+                inst.measure(1.0)
+
+    def test_class_of_a_global_object(self):
+        inst = Instrument("detector", count_with_detector).reference("two", [3, 2], 2).blank("low", [0, 0.5])
+        self.assertTrue(inst.calibrate().passed)
+        with mock.patch.object(Detector, "count", lambda self, xs: 99):  # a method of its class
+            with self.assertRaises(NotCalibrated):
+                inst.measure([0])
+        with mock.patch.object(Detector, "T", -10.0):  # a class attribute
+            with self.assertRaises(NotCalibrated):
+                inst.measure([0])
+        with mock.patch.object(sys.modules[__name__], "DETECTOR", Detector(-10.0)):  # the object rebuilt
+            with self.assertRaises(NotCalibrated):
+                inst.measure([0])
+        self.assertEqual(inst.measure([0, 3]), 1)
+
+    def test_class_based_decorator_and_function_attributes(self):
+        wrapped = scaled(abs, 1.0)
+        inst = Instrument("decorated", wrapped).reference("minus two", -2.0, 2.0).blank("zero", 0.0)
+        self.assertTrue(inst.calibrate().passed)
+        wrapped.k = 50.0
+        with self.assertRaises(NotCalibrated):
+            inst.measure(1.0)
+
+        def over(xs):
+            return sum(1 for x in xs if x > over.threshold)
+        over.threshold = 1.0
+        inst = Instrument("attribute", over).reference("two", [3, 2], 2).blank("low", [0, 0.5])
+        self.assertTrue(inst.calibrate().passed)
+        over.threshold = -10.0
+        with self.assertRaises(NotCalibrated):
+            inst.measure([0])
+
+    def test_library_internals_do_not_cause_refusals(self):
+        def digits(s):
+            return len(re.findall(r"\d", s)) + 0 * random.Random(42).random()
+        inst = Instrument("digits", digits).reference("two", "a1b2", 2).blank("none", "abc")
+        self.assertTrue(inst.calibrate().passed)
+        re.compile("another pattern, cached by the re module")
+        random.random()  # other code draws from the shared generator
+        self.assertEqual(inst.measure("1 2 3"), 3)
+
+    def test_state_changed_during_calibration_fails_it(self):
+        CACHE.clear()
+        inst = Instrument("cache", cached_double).reference("two", 1.0, 2.0).blank("zero", 0.0)
+        report = inst.calibrate()
+        self.assertFalse(report.passed)
+        self.assertIn("changed what it reads while being calibrated", str(report))
+        self.assertTrue(inst.calibrate().passed)  # same cache content the second time
+        self.assertEqual(inst.measure(1.0), 2.0)
+        inst.measure(5.0)  # a new cache entry: the tool changed
+        with self.assertRaises(NotCalibrated):
+            inst.measure(1.0)
+
+    def test_numbers_are_stored_as_floats(self):
+        inst = Instrument("fraction", lambda x: x).reference("half", 0.5, Fraction(1, 2), Fraction(0))
+        inst.blank("zero", 0.0, tolerance=Fraction(0))
+        report = inst.calibrate()
+        self.assertTrue(report.passed)
+        self.assertEqual({type(c.expected) for c in inst.checks} | {type(c.tolerance) for c in inst.checks}, {float})
+        self.assertIs(json.loads(report.to_json())["results"][0]["passed"], True)
+
+    def test_self_referential_data(self):
+        data = [1.0]
+        data.append(data)
+        node = Detector(1.0)
+        node.next = node
+
+        def f(x):
+            return x + 0 * len(data) + 0 * node.t
+        inst = Instrument("cycles", f).reference("one", 1.0, 1.0).blank("zero", 0.0)
+        self.assertTrue(inst.calibrate().passed)
+        self.assertEqual(inst.measure(2.0), 2.0)
+        data[0] = 2.0
+        with self.assertRaises(NotCalibrated):
+            inst.measure(2.0)
+
     # --- persistent history
 
     def test_log_path_appends_one_json_line_per_report(self):
@@ -241,7 +371,9 @@ class ReferenceControlTests(unittest.TestCase):
         self.assertEqual(lines[2]["fingerprint"], good.fingerprint())
         for line in lines:
             self.assertTrue(line["timestamp"].endswith("+00:00"))
-            self.assertEqual(set(line), {"timestamp", "instrument", "version", "fingerprint", "passed", "results"})
+            self.assertEqual(set(line), {"timestamp", "instrument", "version", "fingerprint", "passed", "error",
+                                         "results"})
+            self.assertIsInstance(line["passed"], bool)
 
     def test_nan_is_logged_as_a_string(self):
         report = Instrument("nan", lambda x: float("nan")).blank("flat", FLAT).calibrate()

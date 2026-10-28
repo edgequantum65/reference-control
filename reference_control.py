@@ -6,16 +6,25 @@ every time the tool changes: calibrate() records a fingerprint of the tool
 (its code and what it reads) and of its checks, and measure() refuses as soon
 as that fingerprint differs. A failed reference case is reported and kept,
 never hidden. Until they all pass, the instrument refuses to measure.
+
+The fingerprint is a best effort against accidental changes, not a defence
+against deliberate cheating. README.md lists what it covers and what it does not.
 """
 from __future__ import annotations
 
 import builtins
 import copy
+import dis
+import enum
 import functools
 import hashlib
+import io
 import json
 import math
+import os
 import pickle
+import sys
+import sysconfig
 import types
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -53,10 +62,11 @@ class Report:
     fingerprint: str = ""
     instrument: str = ""
     timestamp: str = ""  # UTC, ISO 8601
+    error: str = ""  # a failure of the calibration itself, not of one check
 
     @property
     def passed(self) -> bool:
-        return bool(self.results) and all(r.passed for r in self.results)
+        return bool(self.results) and all(r.passed for r in self.results) and not self.error
 
     def __str__(self) -> str:
         lines = [f"version {self.version} — {'PASS' if self.passed else 'FAIL'}"]
@@ -64,6 +74,8 @@ class Report:
             kind = "blank" if r.is_blank else "ref  "
             mark = "ok  " if r.passed else "FAIL"
             lines.append(f"  [{mark}] {kind} {r.name}: expected {r.expected}, got {r.got} {r.error}".rstrip())
+        if self.error:
+            lines.append(f"  [FAIL] {self.error}")
         return "\n".join(lines)
 
     def to_json(self) -> str:
@@ -73,138 +85,201 @@ class Report:
         results = [{**asdict(r), "expected": num(r.expected), "got": num(r.got), "tolerance": num(r.tolerance)}
                    for r in self.results]
         return json.dumps({"timestamp": self.timestamp, "instrument": self.instrument, "version": self.version,
-                           "fingerprint": self.fingerprint, "passed": self.passed, "results": results},
-                          ensure_ascii=False, default=repr)
+                           "fingerprint": self.fingerprint, "passed": self.passed, "error": self.error,
+                           "results": results}, ensure_ascii=False, default=repr)
 
 
-# --- Fingerprint: a description of what a function does and reads, without memory addresses.
+# --- Fingerprint. User code (Python functions and classes outside the standard library and
+# site-packages) is described by its bytecode and by what it reads. Library code is described
+# by its name and version only. Data is described by its pickle, or else by its repr.
 
 _PLAIN = (type(None), bool, int, float, complex, str, bytes)
-_BUILTIN_CALLABLES = (types.BuiltinFunctionType, types.MethodWrapperType, types.WrapperDescriptorType,
-                      types.MethodDescriptorType, types.ClassMethodDescriptorType)
+_GLOBAL_OPS = {"LOAD_GLOBAL", "LOAD_NAME", "LOAD_FROM_DICT_OR_GLOBALS"}
+_ATTR_OPS = {"LOAD_ATTR", "LOAD_METHOD", "LOAD_SUPER_ATTR"}
 _CLASS_NOISE = {"__dict__", "__weakref__", "__module__", "__doc__", "__qualname__", "__firstlineno__",
                 "__static_attributes__", "__dataclass_fields__", "__dataclass_params__", "_abc_impl"}
+_LIB_DIRS = tuple({os.path.join(os.path.realpath(p), "") for p in
+                   (sysconfig.get_paths().get(k) for k in ("stdlib", "platstdlib", "purelib", "platlib")) if p})
+_library_cache: dict = {}
+_code_cache: dict = {}
 
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
-def _qualname(obj: Any) -> str:
-    return f"{getattr(obj, '__module__', None)}.{getattr(obj, '__qualname__', getattr(obj, '__name__', '?'))}"
+def _library(module_name: Any) -> bool:
+    """True for the standard library, builtins and installed packages (site-packages)."""
+    top = str(module_name).partition(".")[0]
+    if top not in _library_cache:
+        module = sys.modules.get(top)
+        if module is None:
+            return False  # not an imported module (code made with exec, say): user code
+        path = getattr(module, "__file__", None)
+        if path:
+            path = os.path.realpath(path)
+            lib = path.startswith(_LIB_DIRS) or any(f"{os.sep}{d}{os.sep}" in path
+                                                    for d in ("site-packages", "dist-packages"))
+        else:
+            lib = top in sys.builtin_module_names or top in getattr(sys, "stdlib_module_names", ())
+        _library_cache[top] = lib
+    return _library_cache[top]
 
 
-def _state(obj: Any) -> str:
-    """Any other object: its pickled state, else its repr, else its type."""
-    try:
-        return "pickle " + hashlib.sha256(pickle.dumps(obj, 4)).hexdigest()
-    except Exception:
-        pass
-    try:
-        return "repr " + repr(obj)
-    except Exception:
-        return "type " + _qualname(type(obj))
+def _library_name(module_name: str, name: str = "") -> str:
+    version = getattr(sys.modules.get(module_name.partition(".")[0]), "__version__", "")
+    return f"library {module_name}{'.' + name if name else ''} {version}"
 
 
-def _names(code: types.CodeType) -> set:
-    """Names read by a code object and by the code nested in it (generator expressions, lambdas...)."""
-    names = set(code.co_names)
-    for const in code.co_consts:
-        if isinstance(const, types.CodeType):
-            names |= _names(const)
-    return names
+def _const(c: Any) -> str:
+    if isinstance(c, tuple):
+        return "(" + ",".join(_const(x) for x in c) + ")"
+    if isinstance(c, frozenset):
+        return "{" + ",".join(sorted(_const(x) for x in c)) + "}"
+    return repr(c)
 
 
-def _stable(obj: Any, seen: dict) -> str:
-    """A description of obj that changes when obj changes. seen: objects already described (cycles)."""
+def _code(code: types.CodeType) -> tuple:
+    """Digest, global names and attribute names of a code object and of the code nested in it."""
+    hit = _code_cache.get(id(code))
+    if hit and hit[0] is code:
+        return hit[1:]
+    global_names, attr_names, consts = set(), set(), []
+    for ins in dis.get_instructions(code):
+        if ins.opname in _GLOBAL_OPS:
+            global_names.add(ins.argval)
+        elif ins.opname in _ATTR_OPS:
+            attr_names.add(ins.argval)
+    for c in code.co_consts:
+        if isinstance(c, types.CodeType):  # generator expressions, comprehensions, lambdas, inner functions
+            digest, g, a = _code(c)
+            consts.append(digest)
+            global_names |= g
+            attr_names |= a
+        else:
+            consts.append(_const(c))
+    digest = _sha(f"{code.co_code.hex()}|{','.join(consts)}|{code.co_names}|{code.co_varnames}|"
+                  f"{code.co_freevars}|{code.co_flags}|{code.co_argcount}|{code.co_posonlyargcount}|"
+                  f"{code.co_kwonlyargcount}|{getattr(code, 'co_exceptiontable', b'').hex()}")
+    _code_cache[id(code)] = (code, digest, frozenset(global_names), frozenset(attr_names))
+    return digest, frozenset(global_names), frozenset(attr_names)
+
+
+class _HoldsUserCode(Exception):
+    pass
+
+
+class _Pickler(pickle.Pickler):
+    def reducer_override(self, obj):  # pickle stores functions and classes by name: walk them instead
+        if isinstance(obj, (types.FunctionType, type)):
+            user = not _library(obj.__module__)
+        elif isinstance(obj, (types.MethodType, types.ModuleType, types.CodeType)):
+            user = True
+        else:
+            user = not _library(type(obj).__module__) or "__wrapped__" in getattr(obj, "__dict__", ())
+        if user:
+            raise _HoldsUserCode
+        return NotImplemented
+
+
+def _describe(obj: Any, seen: dict) -> str:
+    """A short description of obj that changes when obj changes. seen: descriptions made so far."""
     if isinstance(obj, _PLAIN):
         return repr(obj)
     if id(obj) in seen:
-        return "<seen>"
-    seen[id(obj)] = obj  # keeps it alive, so its id cannot be reused during this walk
-    if isinstance(obj, (list, tuple)):
-        return f"{type(obj).__name__}({','.join(_stable(x, seen) for x in obj)})"
-    if isinstance(obj, (set, frozenset)):
-        return f"{type(obj).__name__}({','.join(sorted(_stable(x, seen) for x in obj))})"
-    if isinstance(obj, dict):
-        return "dict(" + ",".join(f"{_stable(k, seen)}:{_stable(v, seen)}" for k, v in obj.items()) + ")"
-    if isinstance(obj, types.CodeType):
-        c = obj
-        consts = ",".join(_stable(x, seen) for x in c.co_consts)  # nested code objects included
-        return "code " + _sha(f"{c.co_code.hex()}|{consts}|{c.co_names}|{c.co_varnames}|{c.co_freevars}|"
-                              f"{c.co_flags}|{c.co_argcount}|{c.co_posonlyargcount}|{c.co_kwonlyargcount}|"
-                              f"{getattr(c, 'co_exceptiontable', b'').hex()}")
-    if isinstance(obj, types.ModuleType):
-        return f"module {obj.__name__}"
+        return seen[id(obj)][1]
+    seen[id(obj)] = (obj, "<cycle>")  # keeps obj alive, so its id is not reused during this walk
+    text = _walk(obj, seen)
+    seen[id(obj)] = (obj, text)
+    return text
+
+
+def _walk(obj: Any, seen: dict) -> str:
+    if isinstance(obj, types.FunctionType):
+        return _function(obj, seen)
     if isinstance(obj, type):
-        if obj.__module__ == "builtins":
-            return f"class {obj.__qualname__}"
-        body = {k: v for k, v in vars(obj).items() if k not in _CLASS_NOISE}  # methods, class attributes
-        return f"class {_qualname(obj)}{_stable(obj.__bases__, seen)}{_stable(body, seen)}"
+        if _library(obj.__module__):
+            return _library_name(obj.__module__, obj.__qualname__)
+        skip = _CLASS_NOISE | ({"__new__"} if isinstance(obj, enum.EnumMeta) else set())  # set lazily by enum
+        body = {k: v for k, v in vars(obj).items() if k not in skip}  # methods and class attributes
+        return f"class {obj.__qualname__} " + _sha(_describe(obj.__bases__, seen) + _describe(body, seen))
+    if isinstance(obj, types.ModuleType):
+        return _module(obj, frozenset(), seen)
+    if isinstance(obj, types.MethodType):
+        return f"method({_describe(obj.__func__, seen)},{_describe(obj.__self__, seen)})"
     if isinstance(obj, (staticmethod, classmethod)):
-        return f"{type(obj).__name__}({_stable(obj.__func__, seen)})"
+        return f"{type(obj).__name__}({_describe(obj.__func__, seen)})"
     if isinstance(obj, property):
-        return f"property({_stable((obj.fget, obj.fset, obj.fdel), seen)})"
-    if callable(obj):
-        return _callable(obj, seen)
-    return _state(obj)
-
-
-def _callable(fn: Any, seen: dict) -> str:
-    if isinstance(fn, functools.partial):
-        return f"partial({_stable(fn.func, seen)},{_stable(fn.args, seen)},{_stable(fn.keywords, seen)})"
-    if isinstance(fn, types.MethodType):
-        return f"method({_stable(fn.__func__, seen)},{_stable(fn.__self__, seen)})"
-    if isinstance(fn, types.FunctionType):
-        return _function(fn, seen)
-    if hasattr(fn, "__wrapped__"):  # functools.lru_cache and other C wrappers
-        return f"wrapped {_qualname(type(fn))}({_stable(fn.__wrapped__, seen)})"
-    if isinstance(fn, _BUILTIN_CALLABLES):  # C code: only its name is visible, plus what it is bound to
-        owner = getattr(fn, "__self__", None)
-        bound = "" if owner is None or isinstance(owner, types.ModuleType) else _stable(owner, seen)
-        return f"builtin {_qualname(fn)}{bound}"
-    state = _stable(vars(fn), seen) if hasattr(fn, "__dict__") else _state(fn)
-    return f"instance {_stable(type(fn), seen)}{state}"  # a callable object: its class (__call__) and state
+        return f"property({_describe((obj.fget, obj.fset, obj.fdel), seen)})"
+    if isinstance(obj, functools.cached_property):
+        return f"cached_property({_describe(obj.func, seen)})"
+    try:
+        buffer = io.BytesIO()
+        _Pickler(buffer, 4).dump(obj)
+        return "pickle " + hashlib.sha256(buffer.getvalue()).hexdigest()
+    except Exception:
+        pass  # it holds user code, or it cannot be pickled: describe it piece by piece
+    if isinstance(obj, (list, tuple)):
+        return f"{type(obj).__name__} " + _sha(",".join(_describe(x, seen) for x in obj))
+    if isinstance(obj, (set, frozenset)):
+        return f"{type(obj).__name__} " + _sha(",".join(sorted(_describe(x, seen) for x in obj)))
+    if isinstance(obj, dict):
+        return "dict " + _sha(",".join(f"{_describe(k, seen)}:{_describe(v, seen)}" for k, v in obj.items()))
+    if isinstance(obj, functools.partial):
+        return f"partial({_describe(obj.func, seen)},{_describe(obj.args, seen)},{_describe(obj.keywords, seen)})"
+    if not _library(type(obj).__module__):  # an object of a user class: its class and its state
+        state = dict(getattr(obj, "__dict__", {}))
+        for klass in type(obj).__mro__:
+            slots = getattr(klass, "__slots__", ())
+            for name in [slots] if isinstance(slots, str) else slots:
+                if name not in ("__dict__", "__weakref__") and hasattr(obj, name):
+                    state[name] = getattr(obj, name)
+        return f"object {_describe(type(obj), seen)} {_describe(state, seen)}"
+    if "__wrapped__" in getattr(obj, "__dict__", ()):  # functools.lru_cache and other library wrappers
+        return f"wrapper {type(obj).__qualname__}({_describe(obj.__wrapped__, seen)})"
+    try:
+        return "repr " + repr(obj)
+    except Exception:
+        return _library_name(type(obj).__module__, type(obj).__qualname__)
 
 
 def _function(fn: types.FunctionType, seen: dict) -> str:
-    """Code, defaults, closure cells, and the current value of every global or builtin it reads."""
-    code = fn.__code__
-    parts = [_stable(code, seen), _stable(fn.__defaults__, seen), _stable(fn.__kwdefaults__, seen)]
-    for name, cell in zip(code.co_freevars, fn.__closure__ or ()):
+    """Code, defaults, attributes, closure cells, and the current value of each global it reads."""
+    if _library(fn.__module__):
+        return _library_name(fn.__module__, fn.__qualname__)
+    digest, global_names, attr_names = _code(fn.__code__)
+    parts = [digest, _describe(fn.__defaults__, seen), _describe(fn.__kwdefaults__, seen),
+             _describe(vars(fn), seen)]
+    for name, cell in zip(fn.__code__.co_freevars, fn.__closure__ or ()):
         try:
             value = cell.cell_contents
         except ValueError:  # empty cell
             value = "<empty cell>"
-        parts.append(f"{name}={_stable(value, seen)}")
-    names = _names(code)  # unlike inspect.getclosurevars, this includes names read by nested code
+        parts.append(f"{name}={_describe(value, seen)}")
     builtin_ns = fn.__globals__.get("__builtins__", builtins)
     builtin_ns = vars(builtin_ns) if isinstance(builtin_ns, types.ModuleType) else builtin_ns
-    for name in sorted(names):
+    for name in sorted(global_names):
         for ns in (fn.__globals__, builtin_ns):
             if name in ns:
-                parts.append(f"{name}={_module(ns[name], names, seen)}")
+                value = ns[name]
+                is_module = isinstance(value, types.ModuleType)
+                parts.append(f"{name}={_module(value, attr_names, seen) if is_module else _describe(value, seen)}")
                 break
     return "function " + _sha("|".join(parts))
 
 
-def _module(value: Any, names: set, seen: dict) -> str:
-    """For a module, also describe the attributes the code may read on it (config.THRESHOLD)."""
-    if not isinstance(value, types.ModuleType):
-        return _stable(value, seen)
-    if ("module", id(value)) in seen:
-        return f"module {value.__name__}"
-    seen[("module", id(value))] = value
-    attrs = vars(value)
-    return f"module {value.__name__}(" + ",".join(
-        f"{n}={_module(attrs[n], names, seen)}" for n in sorted(names) if n in attrs) + ")"
-
-
-def _inputs(inputs: Any) -> str:
-    try:
-        return "pickle " + hashlib.sha256(pickle.dumps(inputs, 4)).hexdigest()
-    except Exception:
-        return _stable(inputs, {})
+def _module(module: types.ModuleType, attr_names: frozenset, seen: dict) -> str:
+    """A user module: the attributes the code reads on it (config.THRESHOLD), each described once."""
+    if _library(module.__name__):
+        return _library_name(module.__name__)
+    parts = []
+    for name in sorted(attr_names):
+        if name in vars(module) and (id(module), name) not in seen:
+            seen[(id(module), name)] = (module, "")
+            value = vars(module)[name]
+            is_module = isinstance(value, types.ModuleType)
+            parts.append(f"{name}={_module(value, attr_names, seen) if is_module else _describe(value, seen)}")
+    return f"module {module.__name__}(" + ",".join(parts) + ")"
 
 
 class Instrument:
@@ -223,11 +298,11 @@ class Instrument:
     @property
     def version(self) -> str:
         """Short hash of the function as it is now: code, defaults, closures, globals it reads."""
-        return _sha(_stable(self._fn, {}))[:12]
+        return _sha(_describe(self._fn, {}))[:12]
 
     def _fingerprint(self, version: str) -> str:
-        checks = [(c.name, c.expected, c.tolerance, c.is_blank, _inputs(c.inputs)) for c in self.checks]
-        return _sha(version + _stable(checks, {}))[:16]
+        checks = [(c.name, c.expected, c.tolerance, c.is_blank, c.inputs) for c in self.checks]
+        return _sha(version + _describe(checks, {}))[:16]
 
     def fingerprint(self) -> str:
         """Hash of the version and of every check: name, expected, tolerance, kind, inputs."""
@@ -235,12 +310,12 @@ class Instrument:
 
     def reference(self, name: str, inputs: Any, expected: float, tolerance: float = 0.0) -> "Instrument":
         """inputs are copied: the stored case does not follow later changes to the caller's object."""
-        self.checks.append(Check(name, copy.deepcopy(inputs), expected, tolerance, is_blank=False))
+        self.checks.append(Check(name, copy.deepcopy(inputs), float(expected), float(tolerance), is_blank=False))
         return self
 
     def blank(self, name: str, inputs: Any, tolerance: float = 0.0) -> "Instrument":
         """A blank control: expected is always 0. A float instrument may state a small tolerance."""
-        self.checks.append(Check(name, copy.deepcopy(inputs), 0.0, tolerance, is_blank=True))
+        self.checks.append(Check(name, copy.deepcopy(inputs), 0.0, float(tolerance), is_blank=True))
         return self
 
     def calibrate(self) -> Report:
@@ -253,11 +328,14 @@ class Instrument:
         for c in self.checks:
             try:
                 got = float(self._fn(copy.deepcopy(c.inputs)))  # a copy: fn cannot corrupt the reference case
-                ok = abs(got - c.expected) <= c.tolerance  # False for NaN
+                ok = bool(abs(got - c.expected) <= c.tolerance)  # False for NaN
                 report.results.append(CheckResult(c.name, c.expected, got, ok, c.is_blank, "", c.tolerance))
             except Exception as exc:  # a crash is a failed check, not a hidden one
                 report.results.append(CheckResult(c.name, c.expected, None, False, c.is_blank, repr(exc),
                                                   c.tolerance))
+        if self._fingerprint(self.version) != report.fingerprint:
+            report.error = ("the function changed what it reads while being calibrated (a cache, a counter, "
+                            "a random generator): the checks did not all run on the same tool")
         self.history.append(report)
         if self.log_path is not None:
             with open(self.log_path, "a", encoding="utf-8") as log:  # append-only, never rewritten
