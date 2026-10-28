@@ -1,11 +1,25 @@
 name: tests
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   tests:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.11', '3.13']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
       - run: python -m unittest -v test_reference_control
+      - run: python example_peaks.py
+      - name: README example output is the real output (its hashes are those of Python 3.13 bytecode)
+        if: matrix.python-version == '3.13'
+        run: python check_readme.py
+      - name: The package installs
+        run: |
+          python -m pip install .
+          cd "$RUNNER_TEMP" && python -c "import reference_control; print(reference_control.__file__)"

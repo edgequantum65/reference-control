@@ -41,12 +41,22 @@ def build(fn):
     )
 
 
+def try_measure(inst):
+    try:
+        print("measure(TWO_PEAKS) =", inst.measure(TWO_PEAKS))
+    except NotCalibrated as exc:
+        print("refused:", exc)
+
+
 if __name__ == "__main__":
     for fn in (count_peaks, count_peaks_broken):
         inst = build(fn)
         print(f"--- {fn.__name__}")
         print(inst.calibrate())
-        try:
-            print("measure(TWO_PEAKS) =", inst.measure(TWO_PEAKS))
-        except NotCalibrated as exc:
-            print("refused:", exc)
+        try_measure(inst)
+
+    inst = build(count_peaks)
+    inst.calibrate()  # passes, as above
+    THRESHOLD = -10.0  # then a global the counter reads is changed, its code is not
+    print("--- count_peaks, THRESHOLD set to -10.0 after a passing calibration")
+    try_measure(inst)

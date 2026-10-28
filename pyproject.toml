@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reference-control"
+version = "0.2.0"
+description = "An instrument that refuses to measure until it has passed its reference cases."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+
+[project.urls]
+Homepage = "https://github.com/edgequantum65/reference-control"
+
+[tool.setuptools]
+py-modules = ["reference_control"]
