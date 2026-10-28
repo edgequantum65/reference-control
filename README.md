@@ -1,5 +1,7 @@
 # reference-control
 
+[![tests](https://github.com/edgequantum65/reference-control/actions/workflows/tests.yml/badge.svg)](https://github.com/edgequantum65/reference-control/actions/workflows/tests.yml)
+
 **An instrument that refuses to measure until it has passed its reference cases.**
 
 A rule used in the Edge Quantum 65 lab (Lannemezan, France) for every measuring tool:
